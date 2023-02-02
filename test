@@ -1,0 +1,1011 @@
+USE [WebAdminPortal]
+GO
+
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+
+CREATE PROCEDURE [photo].[StoUpdateMultipleWorkItems] @JSONItemToUpdate				VARCHAR(MAX), 
+                                                 @NewNote							VARCHAR(MAX), 
+                                                 @CreatedBy							INT, 
+                                                 @InProgressOtherComment			VARCHAR(200) = NULL,
+												 @FromRequestImagePortal			BIT = 0,
+												 @VendorSampleIncomingReturnNote	VARCHAR(1000) = NULL
+/************************************************************************************
+Object Name: [photo].[StoUpdateMultipleWorkItems]
+Created By: Marcos Silva
+
+Parameter List:
+@JSONItemToUpdate VARCHAR(MAX)
+@NewNote VARCHAR(MAX),
+@CreatedBy INT,
+@InProgressOtherComment VARCHAR(200)
+@FromRequestImagePortal BIT 
+@VendorSampleIncomingReturnNote VARCHAR(1000)
+
+JSON Object Definition
+
+@JSONItemToUpdate - Array of objects that define changes to items
+[
+	{
+		"ItemNumberId" : INT,
+		"DateRequested" : DATETIME,
+		"FirstContactDate" : DATETIME,
+		"FollowUp" : DATETIME,
+		"AssignedEditor" : INT,
+		"AssignedEditorUsername" : VARCHAR(50),
+		"EditorActionId" : INT,
+		"ProductStatusId" : INT,
+		"ProductSecondaryStatusId" : INT,
+		"IsClearFollowUpDate" : BIT,
+		"ParentItemNumberIds" : VARCHAR(MAX),
+		"ShouldAddDuplicate" : BIT,
+		"RequestId" : INT,
+		"StudioId" : TINYINT,
+		"TrackingNumber" : VARCHAR(50),
+		"TrackingNumberUrl" : VARCHAR(500),
+		"AssociatedRequestItemId" : INT,
+		"ItemDueDate" : DATETIME,
+		"Quantity" : TINYINT,
+		"IsVideoRequired" : BIT, 
+		"IsPhotographyNeeded" : BIT,
+		"IsThreeDimensionalModelNeeded" : BIT,
+		"IsThreeDimensionalRenderNeeded" : BIT,
+		"ThreeDimensionalRenderSubCategoryId" : INT
+	}
+]
+
+Output List:
+N/A
+
+Purpose:
+Updates multiple work items
+
+Change History:
+11/26/2019 - MS - Initial Creation
+12/28/2019 - MS - Added clear followup date parameter
+01/17/2020 - MS - Updated sproc to use json object
+01/20/2020 - ZB - Updated sproc to use ParentItemNumberId 
+02/03/2020 - ZB - Added logic for MIL Parent Items
+04/03/2020 - Zack Benito - Added logic to use the quantity for kit components 
+04/10/2020 - Zack Benito - Added logic to add the RIP ticket # (if exists) and to copy Return Notes from RIP if applicable. 
+04/20/2020 - Zack Benito - Added logic to set the follow up date based on certain product statuses
+05/06/2020 - Scott Peters - Added the ability to pass in a Request Image Portal RequestId to tie to the workflow item
+05/20/2020 - Zack Benito - Added StudioId and TrackingNumber to the JSON
+05/26/2020 - Zack Benito - Added AssociatedRequestItemId to the JSON 
+05/29/2020 - Scott Peters - Simplified RequestId assignment to use the same logic regardless of it is from MIL or RIP 
+06/04/2020 - Marcos Silva - Added ReturnNote parameter, specific for Vendor Sample Incoming action
+06/17/2020 - Zack Benito - Changed JSON parameter to accept multiple values for ParentItemNumbers
+06/22/2020 - Zack Benito - Added Waiting for Stock logic 
+08/10/2020 - Zack Benito - Added logic for updating request ids on child items 
+09/02/2020 - Zack Benito - Added logic for updating kit components 
+10/07/2020 - Zack Benito - Added logic for Buyer Sample Incoming items 
+10/26/2020 - Zack Benito - Updated logic for Buyer Sample Incoming items for Associated Items 
+11/18/2020 - JGuttoh     - Added logic to move IsMissingImageListPrimary flag for MIL and ShouldAddDuplicate=1
+11/27/2020 - JGuttoh     - Fixed UQ error on WorkProcessToRequestItem update
+12/02/2020 - JGuttoh	 - Changed wp update to primary only if coming from MIL
+02/05/2021 - JGuttoh	 - Modified to lookup for either MIL and RIP when inserting/updating wp records. 
+							Also removed specific BSI logic since we want to treat all sources the same
+02/23/2021 - BLong     - Added item not QTR/Returned constraint when updating WorkProcess and inserting WorkProcessParentToAssociatedItem record
+05/13/2021 - JGuttoh   - Added insert to photo.AuditProcedureParameterLog
+07/09/2021 - JMoll		 - If from RIP, coalesce RequestId first, THEN ParentRequestId, in inserts to WorkProcess; else default to existing order of ParentRequestId, then RequestId
+07/19/2021 - JGuttoh   - Add ItemDueDate ADO336078
+10/06/2021 - JGuttoh   - ADO 506305 Account for NULL producstStatusId in WHERE clause
+03/01/2022 - JGuttoh   - ADO 530688 Reset areTasksReviewed if adding RIP ticket to existing WP record
+
+03/11/2022 - JWilhelm  - Pull most recent ParentRequestId to avoid trying to insert duplicates to WorkProcess for ADO586672
+03/15/2022 - JWilhelm  - Use new JSON Quantity column to account for kit components for ADO558471
+03/22/2022 - JWilhelm  - Set InStudio status to VideoRequired when new IsVideoRequired flag is set to 1
+04/14/2022 - JWilhelm  - Include status of 22 (Editing Images) as a 'returned' status when determining whether to update existing records or insert new ones
+						 for ADO578091
+06/13/2022 - JWilhelm  - ADO 635767 Clear out Order Date, Arrival Date, Order Number, and Tracking Number when duplicate items are updated. Change a line to use Concat.
+06/24/2022 - JWilhelm  - ADO 652506 Remove status of 22
+06/23/2022 - JWilhelm  - ADO 590952 Add 3d parameters to input (IsPhotographyNeeded, IsThreeDimensionalModelNeeded, IsThreeDimensionalRenderNeeded, ThreeDimensionalRenderSubCategoryId)
+08/01/2022 - JWilhelm -  ADO 590949 Put JOIN to kit_components back into "UPDATE existing" section. Not all JSON call pass in the QTY field, so quantity_used still may be needed.
+						 Move section that clears out Tracking Number to above the insert to Tracking Number, so data just inserted is not deleted.
+08/19/2022 - JWilhelm  - ADO 686358 Add code to delete from photo.WorkProcessToRequestItem prior to updating multiple rows there
+10/17/2022 - JWilhelm  - ADO 590949 Add the value of 1 to the coalesce line for quantities in the Update Existing block
+10/04/2022 - JGuttoh   - ADO 697124 Added ProductStatusId NOT IN (18,19,21) to #ItemNumbersToRequestIds 
+11/14/2022 - THale	   - ADO 726417 Added logic to update HPR when AssignedEditor/curator changes
+11/15/2022 - Thale	   - ADO 602290 Sync Vendor Sample Return Notes to RIP
+12/12/2022 - Tharpersberger - ADO 752517 Use ThreeDimensionalRenderSubCategoryId to update ProductStatusId for 3D render actions when the ProductStatusId is NULL
+************************************************************************************/
+
+AS
+BEGIN
+
+    SET NOCOUNT ON;
+
+    DROP TABLE IF EXISTS #ItemsToUpdate;
+    DROP TABLE IF EXISTS #WorkProcessIds;
+    DROP TABLE IF EXISTS #MostRecentItemIdentifier;
+    DROP TABLE IF EXISTS #ItemNumbersToRequestIds;
+	DROP TABLE IF EXISTS #ParentItemNumberIds;
+	DROP TABLE IF EXISTS #ChildrenWorkProcessIds;
+	DROP TABLE IF EXISTS #WorkProcessToRequestItemIdsToUpdate;
+
+    CREATE TABLE #WorkProcessIds
+    (WorkProcessId  INT NOT NULL, 
+     ItemIdentifier INT, 
+     RequestId      INT
+    );
+    CREATE TABLE #MostRecentItemIdentifier
+    (ItemIdentifier INT NOT NULL, 
+     WorkProcessId  INT NOT NULL
+    );
+    CREATE TABLE #ItemNumbersToRequestIds
+    (ItemIdentifier INT NULL, 
+	 ParentItemIdentifier INT NULL,
+     RequestId      INT NULL, 
+	 ParentRequestId INT NULL,
+     DateRequested  DATETIME2(2)
+    );
+	CREATE TABLE #ParentItemNumberIds 
+	(
+	ItemIdentifier INT NULL,
+	ParentItemNumberId INT NULL
+	);
+	CREATE TABLE #ChildrenWorkProcessIds
+	(
+	ParentWorkProcessId INT NULL,
+	ChildWorkProcessId INT NULL,
+	ParentRequestId INT NULL,
+	ParentRequestItemId INT NULL
+	);
+    CREATE TABLE #WorkProcessToRequestItemIdsToUpdate
+	(WorkProcessToRequestItemId	INT NOT NULL,
+	WorkProcessId				INT NOT NULL,
+	RequestItemId				INT NOT NULL,
+	ChildWorkProcessId			INT NOT NULL,
+	ParentRequestItemId			INT NOT NULL,
+	KeeperWorkProcessToRequestItemId	INT NOT NULL
+	);
+	CREATE TABLE #ItemsToUpdate
+    (ItemNumberId             INT NOT NULL, 
+     DateRequested            DATETIME, 
+     FirstContactDate         DATETIME, 
+     FollowUp                 DATETIME, 
+     EditorId                 INT, 
+     AssignedEditor           INT, 
+     AssignedEditorUsername   VARCHAR(50), 
+     EditorActionId           INT, 
+     ProductStatusId          INT, 
+     ProductSecondaryStatusId INT, 
+     IsClearFollowUpDate      BIT, 
+     ParentItemNumberIds      VARCHAR(MAX), 
+     ShouldAddDuplicate       BIT,
+	RequestId				  INT,
+	StudioId                 TINYINT,
+	TrackingNumber           VARCHAR(50),
+	TrackingNumberURL        VARCHAR(500),
+	TrackingNumberId         INT,
+	AssociatedRequestItemId  INT,
+	ItemDueDate			 DATETIME2(2),
+	Quantity			 TINYINT,
+	IsVideoRequired BIT NULL,
+	IsPhotographyNeeded BIT NULL,
+	IsThreeDimensionalModelNeeded BIT NULL,
+	IsThreeDimensionalRenderNeeded BIT NULL,
+	ThreeDimensionalRenderSubCategoryId INT NULL
+    );
+
+    DECLARE @NeedsReviewActionId INT;
+    DECLARE @NeedsReviewStatusId INT;
+    DECLARE @BuyerSampleIncomingProductStatusId INT;
+    DECLARE @VendorSampleIncomingProductStatusId INT;
+    DECLARE @RequestSourceId INT;
+    DECLARE @RequestSubCategoryToRequestCategoryId AS TINYINT;
+    DECLARE @RejectedRequestItemStatusId AS TINYINT;
+    DECLARE @InventoryTabId AS TINYINT;
+	DECLARE @WorkProcessIds AS VARCHAR(MAX); 
+	DECLARE @VideoRequiredWorkFlowStatus TINYINT;
+	DECLARE @WaitingForStockProductStatusId AS INT;
+	DECLARE @QueuedForOrderProductStatusId AS INT;
+	DECLARE @ScheduledForOrderProductStatusId AS INT;
+	DECLARE @OrderedFromStockProductStatusId AS INT;
+	DECLARE @PhotoEditorEmployeeNumber AS INT;
+	DECLARE @ItemNumbers VARCHAR(MAX)
+	DECLARE @RequestCommentTypeId AS INT;
+
+
+    SET @FromRequestImagePortal = ISNULL(@FromRequestImagePortal, 0);
+	SET @PhotoEditorEmployeeNumber=NULL;
+
+    SELECT @NeedsReviewActionId = EditorActionId
+    FROM photo.EditorAction
+    WHERE ActionName = 'Needs Review';
+
+    SELECT @NeedsReviewStatusId = ProductStatusId
+    FROM photo.ProductStatus
+    WHERE ProductStatusName = 'Needs Reviewed';
+
+    SELECT @RequestSourceId = RequestSourceId
+    FROM photo.RequestSource
+    WHERE RequestSourceName = (CASE WHEN @FromRequestImagePortal=0 THEN 'MIL' ELSE 'RIP Ticket' END);
+
+    SELECT @RequestSubCategoryToRequestCategoryId = rsctrc.RequestSubCategoryToRequestCategoryId
+    FROM requestImagePortal.RequestSubCategory AS rsc
+         INNER JOIN requestImagePortal.RequestSubCategoryToRequestCategory AS rsctrc ON rsc.RequestSubCategoryId = rsctrc.RequestSubCategoryId
+    WHERE rsc.[Name] = 'New Product';
+
+    SELECT @BuyerSampleIncomingProductStatusId = ProductStatusId
+    FROM photo.ProductStatus
+    WHERE ProductStatusName = 'Buyer Sample Incoming';
+
+    SELECT @VendorSampleIncomingProductStatusId = ProductStatusId
+    FROM photo.ProductStatus
+    WHERE ProductStatusName = 'Vendor Sample Incoming';
+
+    SELECT @RejectedRequestItemStatusId = RequestItemStatusId
+    FROM requestImagePortal.RequestItemStatus AS ris
+    WHERE ris.[Name] = 'Rejected';
+
+    SELECT @InventoryTabId = TabNameId
+    FROM photo.TabName
+    WHERE Description = 'Queue to Order';
+	
+	SELECT @VideoRequiredWorkFlowStatus = IWS.ItemWorkflowStatusId
+	FROM photo.ItemWorkflowStatus AS IWS
+	INNER JOIN photo.ItemWorkflowStatusType AS IWST ON IWST.ItemWorkflowStatusTypeId = IWS.ItemWorkflowStatusTypeId
+    WHERE IWS.WorkflowStatus = 'Required'
+    AND IWST.WorkflowStatusTypeName = 'Video';
+
+	SELECT @WaitingForStockProductStatusId = ProductStatusId
+    FROM photo.ProductStatus
+    WHERE ProductStatusName = 'Waiting for Stock';
+
+	SELECT @QueuedForOrderProductStatusId = ProductStatusId
+    FROM photo.ProductStatus
+    WHERE ProductStatusName = 'Queued for Order';
+
+	SELECT @ScheduledForOrderProductStatusId = ProductStatusId
+    FROM photo.ProductStatus
+    WHERE ProductStatusName = 'Scheduled for Order';
+
+	SELECT @OrderedFromStockProductStatusId = ProductStatusId
+    FROM photo.ProductStatus
+    WHERE ProductStatusName = 'OrderedFromStock';
+
+	SELECT @RequestCommentTypeId = RequestItemCommentTypeId
+	FROM requestImagePortal.RequestItemCommentType
+	WHERE [Name] = 'Return Samples Note';
+
+    /*LOG parameters*/
+    INSERT INTO photo.AuditProcedureParameterLog (StoredProcedureName,
+	JsonParameter,
+	OtherParameters)
+    VALUES('photo.StoUpdateMultipleWorkItems'
+	   , @JSONItemToUpdate
+	   , CONCAT('@NewNote=',@NewNote,
+			 '|@CreatedBy=',CAST(@CreatedBy AS VARCHAR(5)),
+			 '|@InProgressOtherComment=',@InProgressOtherComment,
+			 '|@FromRequestImagePortal=',CAST(@FromRequestImagePortal AS VARCHAR(1)),
+			 '|@VendorSampleIncomingReturnNote=', @VendorSampleIncomingReturnNote));
+
+    INSERT INTO #ItemsToUpdate(ItemNumberId
+                             , DateRequested
+                             , FirstContactDate
+                             , FollowUp
+                             , AssignedEditor
+                             , AssignedEditorUsername
+                             , EditorActionId
+                             , ProductStatusId
+                             , ProductSecondaryStatusId
+                             , IsClearFollowUpDate
+                             , ParentItemNumberIds
+                             , ShouldAddDuplicate
+					    , RequestId
+					    , StudioId
+					    , TrackingNumber
+					    , TrackingNumberURL
+					    , AssociatedRequestItemId
+					    , ItemDueDate
+						, Quantity
+						, IsVideoRequired
+						, IsPhotographyNeeded
+						, IsThreeDimensionalModelNeeded
+						, IsThreeDimensionalRenderNeeded
+						, ThreeDimensionalRenderSubCategoryId)
+    SELECT ItemNumberId
+         , DateRequested
+         , FirstContactDate
+         , FollowUp
+         , AssignedEditor
+         , AssignedEditorUsername
+         , EditorActionId
+         , ProductStatusId
+         , ProductSecondaryStatusId
+         , IsClearFollowUpDate
+         , ParentItemNumberIds
+         , ShouldAddDuplicate
+	    , RequestId
+	    , StudioId
+	    , TrackingNumber
+	    , TrackingNumberURL 
+	    , AssociatedRequestItemId 
+	    , ItemDueDate
+		, Quantity
+		, IsVideoRequired
+		, IsPhotographyNeeded
+		, IsThreeDimensionalModelNeeded
+		, IsThreeDimensionalRenderNeeded
+		, ThreeDimensionalRenderSubCategoryId
+    FROM OPENJSON(@JSONItemToUpdate) 
+	WITH(
+		ItemNumberId INT '$.ItemNumberId', 
+		DateRequested DATETIME2(2) '$.DateRequested', 
+		FirstContactDate DATETIME2(2) '$.FirstContactDate', 
+		FollowUp DATETIME2(2) '$.FollowUp', 
+		AssignedEditor INT '$.AssignedEditor', 
+		AssignedEditorUsername VARCHAR(50) '$.AssignedEditorUsername', 
+		EditorActionId INT '$.EditorActionId', 
+		ProductStatusId INT '$.ProductStatusId', 
+		ProductSecondaryStatusId INT '$.ProductSecondaryStatusId', 
+		IsClearFollowUpDate BIT '$.IsClearFollowUpDate',
+		ParentItemNumberIds VARCHAR(MAX) '$.ParentItemNumberIds', 
+		ShouldAddDuplicate BIT '$.ShouldAddDuplicate',
+		RequestId INT '$.RequestId',
+		StudioId  TINYINT '$.StudioId',
+		TrackingNumber VARCHAR(50) '$.TrackingNumber',
+		TrackingNumberURL VARCHAR(500) '$.TrackingNumberUrl',
+		AssociatedRequestItemId INT '$.AssociatedRequestItemId',
+		ItemDueDate DATETIME2(2) '$.ItemDueDate',
+		Quantity TINYINT '$.Quantity',
+		IsVideoRequired BIT '$.IsVideoRequired',
+		IsPhotographyNeeded BIT '$.IsPhotographyNeeded',
+		IsThreeDimensionalModelNeeded BIT '$.IsThreeDimensionalModelNeeded',
+		IsThreeDimensionalRenderNeeded BIT '$.IsThreeDimensionalRenderNeeded',
+		ThreeDimensionalRenderSubCategoryId INT '$.ThreeDimensionalRenderSubCategoryId'
+		);
+
+	INSERT INTO #ParentItemNumberIds (ItemIdentifier,
+									  ParentItemNumberId)
+
+	SELECT IU.ItemNumberId,
+		   CAST(P.[value] AS INT)
+
+	FROM #ItemsToUpdate IU
+	  CROSS APPLY STRING_SPLIT(IU.ParentItemNumberIds,',') P 
+	WHERE IU.ParentItemNumberIds IS NOT NULL;
+
+
+    /* Gathering photo editor ids*/
+    INSERT INTO photo.PhotoEditor(EmployeeNumber
+                                , Username)
+    SELECT IU.AssignedEditor
+         , IU.AssignedEditorUsername
+    FROM #ItemsToUpdate AS IU
+         LEFT JOIN photo.PhotoEditor AS PE ON PE.EmployeeNumber = IU.AssignedEditor
+    WHERE IU.AssignedEditor IS NOT NULL
+          AND PE.PhotoEditorId IS NULL
+    GROUP BY  IU.AssignedEditor
+			 , IU.AssignedEditorUsername;
+
+	SELECT DISTINCT
+		   @PhotoEditorEmployeeNumber = AssignedEditor
+	FROM #ItemsToUpdate;
+	 
+
+	/*Gathering tracking numbers*/
+	INSERT INTO photo.TrackingNumber(TrackingNumberName,
+									 TrackingURL)
+
+	SELECT IU.TrackingNumber,
+	       IU.TrackingNumberURL
+		   FROM #ItemsToUpdate IU
+	LEFT JOIN photo.TrackingNumber TN ON TN.TrackingNumberName = IU.TrackingNumber
+	WHERE TN.TrackingNumberName IS NULL 
+	     AND IU.TrackingNumber IS NOT NULL 
+	GROUP BY IU.TrackingNumber,
+		 IU.TrackingNumberURL;
+
+
+	INSERT INTO #ItemNumbersToRequestIds (ItemIdentifier,
+		                                    ParentItemIdentifier,
+											ParentRequestId,
+											RequestId)
+
+	SELECT DISTINCT
+			ITU.ItemNumberId,
+			P.ParentItemNumberId,
+			WP.RequestId AS ParentRequestId,
+			ITU.RequestId
+    FROM #ItemsToUpdate ITU 
+	 LEFT JOIN #ParentItemNumberIds P ON P.ItemIdentifier = ITU.ItemNumberId
+	 LEFT JOIN photo.WorkProcess WP ON WP.ItemIdentifier = P.ParentItemNumberId AND wp.ProductStatusId NOT IN (18,19,21) ;
+
+
+	UPDATE IRI 
+	SET IRI.DateRequested = R.DateRequested
+	FROM #ItemNumbersToRequestIds IRI
+	INNER JOIN requestImagePortal.Request R ON IRI.RequestId = R.RequestId
+	INNER JOIN requestImagePortal.RequestItem RI ON R.RequestId = RI.RequestId AND RI.ItemIdentifier = COALESCE(IRI.ParentItemIdentifier, IRI.ItemIdentifier);
+
+
+    UPDATE IU
+    SET 
+        EditorId = PE.PhotoEditorId
+    FROM #ItemsToUpdate IU
+         INNER JOIN photo.PhotoEditor PE ON PE.EmployeeNumber = IU.AssignedEditor
+    WHERE IU.AssignedEditor IS NOT NULL;
+
+	UPDATE IU
+    SET 
+        IU.TrackingNumberId = TN.TrackingNumberId
+    FROM #ItemsToUpdate IU
+         INNER JOIN photo.TrackingNumber TN ON TN.TrackingNumberName = IU.TrackingNumber
+    WHERE IU.TrackingNumber IS NOT NULL;
+
+
+	/*UPDATE existing */
+	UPDATE WP
+	SET 
+		WP.PhotoEditorId = ISNULL(IU.EditorId, WP.PhotoEditorId), 
+		WP.EditorActionId = ISNULL(IU.EditorActionId, WP.EditorActionId), 
+		WP.DateRequested = CASE WHEN IU.ProductStatusId IN (@WaitingForStockProductStatusId, @QueuedForOrderProductStatusId, @ScheduledForOrderProductStatusId
+															  , @OrderedFromStockProductStatusId, @VendorSampleIncomingProductStatusId, @BuyerSampleIncomingProductStatusId)
+								THEN NULL
+								ELSE ISNULL(IU.DateRequested, WP.DateRequested)
+						   END, 
+		WP.FirstContactDate = ISNULL(WP.FirstContactDate, IU.FirstContactDate), 
+		WP.FollowUpDate = CASE
+								WHEN IU.IsClearFollowUpDate = 1
+								THEN NULL
+								ELSE ISNULL(IU.FollowUp, WP.FollowUpDate)
+							END, 
+		WP.ProductStatusId = ISNULL(IU.ProductStatusId, ISNULL(IU.ThreeDimensionalRenderSubCategoryId, WP.ProductStatusId)),
+		WP.ProductSecondaryStatusId = ISNULL(IU.ProductSecondaryStatusId, WP.ProductSecondaryStatusId), 
+		WP.RequestId =  IIF(@FromRequestImagePortal = 1, COALESCE(IRI.RequestId,IRI.ParentRequestId, WP.RequestId),COALESCE(IRI.ParentRequestId, IRI.RequestId, WP.RequestId)),
+		WP.ItemFollowUpDate = CASE
+									WHEN IU.ProductStatusId = @BuyerSampleIncomingProductStatusId
+										OR IU.ProductStatusId = @VendorSampleIncomingProductStatusId
+										AND @FromRequestImagePortal = 0
+									THEN DATEADD(WEEK, 1, CAST(CONVERT(VARCHAR(10), GETDATE(), 101) AS DATETIME2(2)))
+									ELSE 
+									CASE WHEN IU.ProductStatusId = @BuyerSampleIncomingProductStatusId AND @FromRequestImagePortal = 1 
+									THEN NULL 
+									ELSE WP.ItemFollowUpDate
+								END END,
+		WP.StudioId = ISNULL(IU.StudioId, WP.StudioId),
+		WP.ItemDueDate = ISNULL(IU.ItemDueDate, WP.ItemDueDate),
+		WP.Quantity = COALESCE(IU.Quantity,KCC.quantity_used,WP.Quantity,1),
+		WP.AreTasksReviewed = IIF(wp.RequestId IS NULL AND IU.RequestId IS NOT NULL, 0, WP.AreTasksReviewed),
+		WP.IsVideoRequired = ISNULL(IU.IsVideoRequired, WP.IsVideoRequired),
+		WP.ItemArrivalDate = CASE WHEN IU.ProductStatusId IN (@WaitingForStockProductStatusId, @QueuedForOrderProductStatusId, @ScheduledForOrderProductStatusId
+															  , @OrderedFromStockProductStatusId, @VendorSampleIncomingProductStatusId, @BuyerSampleIncomingProductStatusId)
+								  THEN NULL
+								  ELSE WP.ItemArrivalDate
+							 END,
+		WP.PhotoOrderId = CASE WHEN IU.ProductStatusId IN (@WaitingForStockProductStatusId, @QueuedForOrderProductStatusId, @ScheduledForOrderProductStatusId
+															  , @OrderedFromStockProductStatusId, @VendorSampleIncomingProductStatusId, @BuyerSampleIncomingProductStatusId)
+								  THEN NULL
+								  ELSE WP.PhotoOrderId
+							 END,
+		WP.IsPhotographyNeeded = ISNULL(IU.IsPhotographyNeeded, WP.IsPhotographyNeeded),
+		WP.IsThreeDimensionalModelNeeded = ISNULL(IU.IsThreeDimensionalModelNeeded, WP.IsThreeDimensionalModelNeeded),
+		WP.IsThreeDimensionalRenderNeeded = ISNULL(IU.IsThreeDimensionalRenderNeeded, WP.IsThreeDimensionalRenderNeeded)
+	OUTPUT inserted.WorkProcessId
+			, inserted.ItemIdentifier
+			, inserted.RequestId
+			INTO #WorkProcessIds(WorkProcessId
+								, ItemIdentifier
+								, RequestId)
+	FROM photo.WorkProcess WP
+			INNER JOIN #ItemsToUpdate IU ON IU.ItemNumberId = WP.ItemIdentifier
+			LEFT JOIN #ParentItemNumberIds AS P ON P.ItemIdentifier = IU.ItemNumberId
+			LEFT JOIN Clarkitbiz.products.kit_components AS KCC ON IU.ItemNumberId = KCC.part_item_number_id
+                                                                AND P.ParentItemNumberId = KCC.parent_Products_ItemNumber_id
+                                                                AND KCC.[location] = 851
+			LEFT JOIN #ItemNumbersToRequestIds IRI ON IRI.ItemIdentifier = IU.ItemNumberId
+	WHERE IU.ShouldAddDuplicate = 0
+		AND ((WP.RequestSourceId = 1 AND WP.IsMissingImageListPrimary = 1) OR WP.RequestSourceId = 2)
+		AND ISNULL(WP.ProductStatusId,1) NOT IN (18,19);
+
+
+	/*INSERT Duplicate */
+	UPDATE WP
+	SET IsMissingImageListPrimary = 0
+	FROM photo.WorkProcess WP
+			 INNER JOIN #ItemsToUpdate IU ON IU.ItemNumberId = WP.ItemIdentifier
+	WHERE IU.ShouldAddDuplicate = 1
+		AND @FromRequestImagePortal=0;
+
+    INSERT INTO photo.WorkProcess(ItemIdentifier
+                                , PhotoEditorId
+                                , EditorActionId
+                                , ProductStatusId
+                                , DateRequested
+                                , FirstContactDate
+                                , FollowUpDate
+                                , ProductSecondaryStatusId
+                                , RequestSourceId
+                                , Quantity
+                                , IsMissingImageListPrimary
+                                , RequestId
+                                , ItemFollowUpDate
+						  , StudioId
+						  , ItemDueDate
+						  , IsVideoRequired
+						  , IsPhotographyNeeded
+						  , IsThreeDimensionalModelNeeded
+						  , IsThreeDimensionalRenderNeeded)
+    OUTPUT inserted.WorkProcessId
+         , inserted.ItemIdentifier
+         , inserted.RequestId
+           INTO #WorkProcessIds(WorkProcessId
+                              , ItemIdentifier
+                              , RequestId)
+    SELECT IU.ItemNumberId
+         , IU.EditorId
+         , ISNULL(IU.EditorActionId, @NeedsReviewActionId)
+         , ISNULL(IU.ProductStatusId, ISNULL(IU.ThreeDimensionalRenderSubCategoryId, @NeedsReviewStatusId))
+         , IU.DateRequested
+         , IU.FirstContactDate
+         , CASE
+               WHEN IU.IsClearFollowUpDate = 1
+               THEN NULL
+               ELSE IU.FollowUp
+           END
+         , IU.ProductSecondaryStatusId
+         , @RequestSourceId
+         , ISNULL(MAX(KCC.quantity_used), 1) AS Quantity
+         , CASE 
+				WHEN @FromRequestImagePortal=0 
+				THEN CAST(1 AS BIT) 
+				ELSE CAST(0 AS BIT) 
+		   END
+         , IIF(@FromRequestImagePortal = 1, ISNULL(IU.RequestId, MAX(IRI.ParentRequestId)), ISNULL(MAX(IRI.ParentRequestId), IU.RequestId))
+         , CASE
+               WHEN IU.ProductStatusId = @BuyerSampleIncomingProductStatusId
+                    OR IU.ProductStatusId = @VendorSampleIncomingProductStatusId
+					AND @FromRequestImagePortal = 0
+               THEN DATEADD(WEEK, 1, CAST(CONVERT(VARCHAR(10), GETDATE(), 101) AS DATETIME2(2)))
+               ELSE NULL
+           END
+		 , IU.StudioId
+		 , IU.ItemDueDate
+		 , ISNULL(IU.IsVideoRequired,0)
+		 , ISNULL(IU.IsPhotographyNeeded,1)
+		 , ISNULL(IU.IsThreeDimensionalModelNeeded,0)
+		 , ISNULL(IU.IsThreeDimensionalRenderNeeded,0)
+    FROM #ItemsToUpdate AS IU
+		 LEFT JOIN #ParentItemNumberIds AS P ON P.ItemIdentifier = IU.ItemNumberId
+         LEFT JOIN Clarkitbiz.products.kit_components AS KCC ON IU.ItemNumberId = KCC.part_item_number_id
+                                                                AND P.ParentItemNumberId = KCC.parent_Products_ItemNumber_id
+                                                                AND KCC.[location] = 851
+         LEFT JOIN #ItemNumbersToRequestIds AS IRI ON IRI.ItemIdentifier = IU.ItemNumberId
+    WHERE IU.ShouldAddDuplicate = 1
+		GROUP BY IU.ItemNumberId
+		   , IU.EditorId
+		   , IU.EditorActionId
+		   , IU.ProductStatusId
+		   , IU.ThreeDimensionalRenderSubCategoryId
+		   , IU.DateRequested
+		   , IU.FirstContactDate
+		   , IU.IsClearFollowUpDate
+		   , IU.FollowUp
+		   , IU.ProductSecondaryStatusId
+		   , IU.RequestId
+		   , IU.StudioId
+		   , IU.ItemDueDate
+		   , IU.IsVideoRequired
+		   , IU.IsPhotographyNeeded
+		   , IU.IsThreeDimensionalModelNeeded
+		   , IU.IsThreeDimensionalRenderNeeded;
+
+
+     /*INSERT new row if does not exist */
+    INSERT INTO photo.WorkProcess(ItemIdentifier
+                                , PhotoEditorId
+                                , EditorActionId
+                                , ProductStatusId
+                                , DateRequested
+                                , FirstContactDate
+                                , FollowUpDate
+                                , ProductSecondaryStatusId
+                                , RequestSourceId
+                                , Quantity
+                                , IsMissingImageListPrimary
+                                , RequestId
+                                , ItemFollowUpDate
+						  , StudioId
+						  , ItemDueDate
+						  , IsVideoRequired
+						  , IsPhotographyNeeded
+						  , IsThreeDimensionalModelNeeded
+						  , IsThreeDimensionalRenderNeeded)
+    OUTPUT inserted.WorkProcessId
+         , inserted.ItemIdentifier
+         , inserted.RequestId
+           INTO #WorkProcessIds(WorkProcessId
+                              , ItemIdentifier
+                              , RequestId)
+    SELECT IU.ItemNumberId
+         , IU.EditorId
+         , ISNULL(IU.EditorActionId, @NeedsReviewActionId)
+         , ISNULL(IU.ProductStatusId, ISNULL(IU.ThreeDimensionalRenderSubCategoryId, @NeedsReviewStatusId))
+         , IU.DateRequested
+         , IU.FirstContactDate
+         , CASE
+               WHEN IU.IsClearFollowUpDate = 1
+               THEN NULL
+               ELSE IU.FollowUp
+           END
+         , IU.ProductSecondaryStatusId
+         , @RequestSourceId
+         , ISNULL(MAX(KCC.quantity_used), 1) AS Quantity
+         		 , (CASE
+				WHEN @FromRequestImagePortal = 0
+				THEN 1
+				ELSE 0
+			END)
+         , IIF(@FromRequestImagePortal = 1, ISNULL(IRI.RequestId, MAX(IRI.ParentRequestId)), ISNULL(MAX(IRI.ParentRequestId), IRI.RequestId))
+         , CASE
+               WHEN (IU.ProductStatusId = @BuyerSampleIncomingProductStatusId
+                    OR IU.ProductStatusId = @VendorSampleIncomingProductStatusId)
+					AND @FromRequestImagePortal = 0
+               THEN DATEADD(WEEK, 1, CAST(CONVERT(VARCHAR(10), GETDATE(), 101) AS DATETIME2(2)))
+               ELSE NULL
+           END
+		  , IU.StudioId
+		  , IU.ItemDueDate
+		  , ISNULL(IU.IsVideoRequired,0)
+		  , ISNULL(IU.IsPhotographyNeeded,1)
+		  , ISNULL(IU.IsThreeDimensionalModelNeeded,0)
+		  , ISNULL(IU.IsThreeDimensionalRenderNeeded,0)
+    FROM #ItemsToUpdate AS IU
+		 LEFT JOIN #ParentItemNumberIds AS P ON P.ItemIdentifier = IU.ItemNumberId
+         LEFT JOIN photo.WorkProcess AS WP ON WP.ItemIdentifier = IU.ItemNumberId
+										     AND WP.RequestSourceId IN (1,2) AND ISNULL(WP.ProductStatusId,1) NOT IN (18,19,21)
+		 LEFT JOIN #WorkProcessIds AS WP2 ON WP2.ItemIdentifier = IU.ItemNumberId
+         LEFT JOIN Clarkitbiz.products.kit_components AS KCC ON IU.ItemNumberId = KCC.part_item_number_id
+                                                                AND P.ParentItemNumberId = KCC.parent_Products_ItemNumber_id
+                                                                AND KCC.[location] = 851
+         LEFT JOIN #ItemNumbersToRequestIds AS IRI ON IRI.ItemIdentifier = IU.ItemNumberId
+    WHERE WP.WorkProcessId IS NULL 
+		  AND WP2.WorkProcessId IS NULL
+	GROUP BY IU.ItemNumberId
+		   , IU.EditorId
+		   , IU.EditorActionId
+		   , IU.ProductStatusId
+		   , IU.ThreeDimensionalRenderSubCategoryId
+		   , IU.DateRequested
+		   , IU.FirstContactDate
+		   , IU.IsClearFollowUpDate
+		   , IU.FollowUp
+		   , IU.ProductSecondaryStatusId
+		   , IRI.RequestId
+		   , IRI.ParentRequestId
+		   , IU.StudioId
+		   , IU.ItemDueDate
+		   , IU.IsVideoRequired
+		   , IU.IsPhotographyNeeded
+		   , IU.IsThreeDimensionalModelNeeded
+		   , IU.IsThreeDimensionalRenderNeeded;
+
+	
+
+
+
+	IF @PhotoEditorEmployeeNumber IS NOT NULL
+		BEGIN
+
+
+			SET @ItemNumbers = STUFF(
+											(SELECT CONCAT(',', I.ItemNumber)
+											 FROM #ItemsToUpdate IU
+											 INNER JOIN ContentCatalog.item.item I
+                                             ON IU.itemnumberid = I.ItemIdentifier
+											 FOR XML PATH('')
+											), 1, 1, '');
+
+			EXEC [ContentCatalog].[hiddenProduct].[StoUpdateMultipleItems] @ItemNumbers = @ItemNumbers
+																		 , @EmployeeNumber = @CreatedBy
+																		 , @CuratorEmployeeNumber = @PhotoEditorEmployeeNumber
+																		 , @DoUpdate=1;
+		END;
+																	
+
+    INSERT INTO #MostRecentItemIdentifier(ItemIdentifier
+                                        , WorkProcessId)
+    SELECT ItemIdentifier
+         , MAX(WorkProcessId) AS DateCreated
+    FROM photo.WorkProcess
+    GROUP BY ItemIdentifier;
+
+	/* Clear out any existing tracking info for items being updated */
+	DELETE TNTWP
+	FROM photo.WorkProcess WP
+	INNER JOIN #ItemsToUpdate IU ON IU.ItemNumberId = WP.ItemIdentifier
+	INNER JOIN photo.TrackingNumberToWorkProcess AS TNTWP ON TNTWP.WorkProcessId = WP.WorkProcessId
+	WHERE IU.ShouldAddDuplicate = 0
+		AND IU.ProductStatusId IN (@WaitingForStockProductStatusId, @QueuedForOrderProductStatusId, @ScheduledForOrderProductStatusId
+								   , @OrderedFromStockProductStatusId, @VendorSampleIncomingProductStatusId, @BuyerSampleIncomingProductStatusId);
+
+	INSERT INTO photo.TrackingNumberToWorkProcess(WorkProcessId,
+												  TrackingNumberId)
+	SELECT WP.WorkProcessId,
+	       IU.TrackingNumberId 
+	FROM photo.WorkProcess WP 
+	INNER JOIN #ItemsToUpdate IU ON IU.ItemNumberId = WP.ItemIdentifier
+									AND WP.RequestSourceId IN (1,2) 
+	INNER JOIN #MostRecentItemIdentifier PM ON PM.ItemIdentifier = WP.ItemIdentifier
+	                                        AND PM.WorkProcessId = WP.WorkProcessId
+	LEFT JOIN photo.TrackingNumberToWorkProcess TNT ON TNT.WorkProcessId = WP.WorkProcessId
+												   AND TNT.TrackingNumberId = IU.TrackingNumberId
+	WHERE TNT.WorkProcessId IS NULL
+	AND IU.TrackingNumberId IS NOT NULL; 
+
+	INSERT INTO photo.WorkProcessToRequestItem (WorkProcessId,
+											    RequestItemId)
+	SELECT DISTINCT WP.WorkProcessId,
+	       RI.RequestItemId
+    	FROM photo.WorkProcess WP 
+	INNER JOIN #ItemsToUpdate IU ON IU.ItemNumberId = WP.ItemIdentifier
+									AND WP.RequestSourceId IN (1,2) 
+	INNER JOIN #MostRecentItemIdentifier PM ON PM.ItemIdentifier = WP.ItemIdentifier
+	                                        AND PM.WorkProcessId = WP.WorkProcessId
+	INNER JOIN #ItemNumbersToRequestIds IRI ON IRI.ItemIdentifier = IU.ItemNumberId
+	INNER JOIN requestImagePortal.RequestItem RI ON RI.RequestId = WP.RequestId
+												 AND RI.ItemIdentifier = IRI.ParentItemIdentifier
+	LEFT JOIN photo.WorkProcessToRequestItem WRI ON WRI.WorkProcessId = WP.WorkProcessId
+											 AND WRI.RequestItemId = RI.RequestItemId
+	WHERE WRI.WorkProcessId IS NULL 
+	AND IU.AssociatedRequestItemId IS NULL;
+
+	INSERT INTO photo.WorkProcessToRequestItem (WorkProcessId,
+											    RequestItemId)
+	SELECT DISTINCT WP.WorkProcessId,
+	       IU.AssociatedRequestItemId
+    	FROM photo.WorkProcess WP 
+	INNER JOIN #ItemsToUpdate IU ON IU.ItemNumberId = WP.ItemIdentifier
+									AND WP.RequestSourceId IN (1,2) 
+	INNER JOIN #MostRecentItemIdentifier PM ON PM.ItemIdentifier = WP.ItemIdentifier
+	                                        AND PM.WorkProcessId = WP.WorkProcessId
+	LEFT JOIN photo.WorkProcessToRequestItem WRI ON WRI.WorkProcessId = WP.WorkProcessId
+											 AND WRI.RequestItemId = IU.AssociatedRequestItemId
+	WHERE WRI.WorkProcessId IS NULL 
+	AND IU.AssociatedRequestItemId IS NOT NULL;
+
+
+
+    INSERT INTO photo.WorkProcessParentToAssociatedItem(ParentWorkProcessId
+                                                      , ChildWorkProcessId)
+    SELECT DISTINCT WP.WorkProcessId
+         , WP2.WorkProcessId
+    FROM photo.WorkProcess AS WP
+         INNER JOIN #ParentItemNumberIds AS P ON P.ParentItemNumberId = WP.ItemIdentifier
+                                            AND WP.RequestSourceId IN (1,2) 
+		 INNER JOIN #ItemsToUpdate IU ON IU.ItemNumberId = P.ItemIdentifier
+         INNER JOIN photo.WorkProcess AS WP2 ON IU.ItemNumberId = WP2.ItemIdentifier
+                                                AND WP2.RequestSourceId IN (1,2) 
+         INNER JOIN #MostRecentItemIdentifier AS WPM ON WPM.WorkProcessId = WP.WorkProcessId
+                                                        AND WPM.ItemIdentifier = WP.ItemIdentifier
+         INNER JOIN #MostRecentItemIdentifier AS WPM2 ON WPM2.WorkProcessId = WP2.WorkProcessId
+                                                         AND WPM2.ItemIdentifier = WP2.ItemIdentifier
+         LEFT JOIN photo.WorkProcessParentToAssociatedItem AS WPTA ON WPTA.ChildWorkProcessId = WP2.WorkProcessId
+                                                                      AND WPTA.ParentWorkProcessId = WP.WorkProcessId
+    WHERE WPTA.ChildWorkProcessId IS NULL
+          AND WPTA.ParentWorkProcessId IS NULL
+          AND ISNULL(WP.ProductStatusId,1) NOT IN (18,19)
+          AND ISNULL(WP2.ProductStatusId,1) NOT IN (18,19);
+
+	INSERT INTO #ChildrenWorkProcessIds
+	(ParentWorkProcessId,
+	 ChildWorkProcessId,
+	 ParentRequestId,
+	 ParentRequestItemId)
+
+	SELECT WPI.WorkProcessId,
+	       WPA.ChildWorkProcessId,
+		   WP.RequestId,
+		   RI.RequestItemId
+	FROM #WorkProcessIds WPI
+	INNER JOIN photo.WorkProcessParentToAssociatedItem WPA ON WPA.ParentWorkProcessId = WPI.WorkProcessId
+	INNER JOIN photo.WorkProcess WP ON WP.WorkProcessId = WPA.ParentWorkProcessId
+	INNER JOIN requestImagePortal.RequestItem RI ON RI.RequestId = WP.RequestId
+											     AND RI.ItemIdentifier = WP.ItemIdentifier;
+
+
+
+	 UPDATE WP
+	 SET WP.RequestId = CWP.ParentRequestId 
+	 FROM photo.WorkProcess WP
+	 INNER JOIN #ChildrenWorkProcessIds CWP ON CWP.ChildWorkProcessId = WP.WorkProcessId;
+
+	 INSERT INTO #WorkProcessToRequestItemIdsToUpdate
+	 (WorkProcessToRequestItemId
+	 ,WorkProcessId
+	 ,RequestItemId
+	 ,ChildWorkProcessId
+	 ,ParentRequestItemId
+	 ,KeeperWorkProcessToRequestItemId)
+	 
+	 SELECT WRI.WorkProcessToRequestItemId
+		  , WRI.WorkProcessId
+		  , WRI.RequestItemId
+		  , CWP.ChildWorkProcessId
+		  , CWP.ParentRequestItemId
+		  , FIRST_VALUE(WRI.WorkProcessToRequestItemId) OVER (PARTITION BY WRI.WorkProcessId  ORDER BY WRI.WorkProcessToRequestItemId DESC) AS WorkProcessToRequestItemId
+	 FROM photo.WorkProcessToRequestItem WRI
+	 INNER JOIN #ChildrenWorkProcessIds CWP ON CWP.ChildWorkProcessId = WRI.WorkProcessId
+
+	 /*If there are a lot of child items being assigned to 1 parent request item id, you'll get a UQ key error. First delete the extra rows*/
+	 DELETE WRI
+	 FROM #WorkProcessToRequestItemIdsToUpdate AS WRIKeep
+	 INNER JOIN photo.WorkProcessToRequestItem AS WRI
+		ON WRI.WorkProcessId = WRIKeep.WorkProcessId
+		AND WRI.RequestItemId = WRIKeep.RequestItemId
+	 WHERE WRI.WorkProcessToRequestItemId <> WRIKeep.KeeperWorkProcessToRequestItemId;
+	 UPDATE WRI
+	 SET 
+		WRI.RequestItemId = CWP.ParentRequestItemId
+	 FROM photo.WorkProcessToRequestItem WRI
+		 INNER JOIN #ChildrenWorkProcessIds CWP ON CWP.ChildWorkProcessId = WRI.WorkProcessId
+		 LEFT JOIN photo.WorkProcessToRequestItem WRI2 ON WRI2.WorkProcessId = CWP.ChildWorkProcessId 
+														  AND WRI2.RequestItemId = CWP.ParentRequestItemId
+	 WHERE WRI2.workprocessId IS NULL;
+
+	 INSERT INTO photo.WorkProcessToRequestItem(WorkProcessId
+											 , RequestItemId)
+	 SELECT DISTINCT 
+		   CWP.ChildWorkProcessId
+		 , CWP.ParentRequestItemId
+	 FROM #ChildrenWorkProcessIds AS CWP
+		 LEFT JOIN photo.WorkProcessToRequestItem AS WRI ON WRI.WorkProcessId = CWP.ChildWorkProcessId
+															AND WRI.RequestItemId = CWP.ParentRequestItemId
+	 WHERE WRI.WorkProcessId IS NULL;
+
+
+	 SELECT @WorkProcessIds = CONCAT(COALESCE(@WorkProcessIds + ',', ''), CAST(WPI.WorkProcessId AS VARCHAR(10)))
+	 FROM  #WorkProcessIds WPI
+	 WHERE WPI.WorkProcessId IS NOT NULL 
+	 GROUP BY WPI.WorkProcessId;
+
+    IF LEN(ISNULL(@NewNote, '')) > 0
+    BEGIN
+        INSERT INTO photo.WorkProcessNote(WorkProcessId
+                                        , Note
+                                        , CreatedByEmployeeNumber)
+        SELECT WorkProcessId
+             , @NewNote
+             , @CreatedBy
+        FROM #WorkProcessIds;
+    END;
+
+    IF LEN(ISNULL(@InProgressOtherComment, '')) > 0
+    BEGIN
+        INSERT INTO photo.WorkProcessNote(WorkProcessId
+                                        , Note
+                                        , CreatedByEmployeeNumber)
+        SELECT WorkProcessId
+             , @InProgressOtherComment
+             , @CreatedBy
+        FROM #WorkProcessIds;
+    END;
+
+    INSERT INTO photo.ReturnNote(Note
+                               , WorkProcessId
+                               , CreatedByEmployeeNumber)
+    SELECT RIC.ItemComment
+         , WPI.WorkProcessId
+         , @CreatedBy
+    FROM #ItemsToUpdate AS IU
+         INNER JOIN #WorkProcessIds AS WPI ON WPI.ItemIdentifier = IU.ItemNumberId
+         INNER JOIN requestImagePortal.RequestItem AS RI ON RI.ItemIdentifier = WPI.ItemIdentifier
+                                                            AND RI.RequestId = WPI.RequestId
+         INNER JOIN requestImagePortal.RequestItemComment AS RIC ON RIC.RequestItemId = RI.RequestItemId
+         INNER JOIN requestImagePortal.RequestItemCommentType AS RICT ON RICT.RequestItemCommentTypeId = RIC.RequestItemCommentTypeId
+         INNER JOIN photo.ProductStatus AS PS ON PS.ProductStatusId = IU.ProductStatusId
+         INNER JOIN photo.ProductStatusToTabName AS PSTN ON PSTN.ProductStatusId = PS.ProductStatusId
+         INNER JOIN photo.TabName AS TN ON TN.TabNameId = PSTN.TabNameId
+         LEFT JOIN photo.ReturnNote AS RN ON RN.WorkProcessId = WPI.WorkProcessId
+    WHERE RICT.RequestItemCommentTypeId = @RequestCommentTypeId
+          AND RN.WorkProcessId IS NULL;
+	
+	IF @VendorSampleIncomingReturnNote IS NOT NULL AND LEN(LTRIM(RTRIM(@VendorSampleIncomingReturnNote))) > 0 
+	BEGIN
+
+		UPDATE RN
+		SET 
+			Note = @VendorSampleIncomingReturnNote
+		FROM photo.ReturnNote RN
+		INNER JOIN #WorkProcessIds WPI
+		ON RN.WorkProcessId = WPI.WorkProcessId;
+
+		INSERT INTO photo.ReturnNote(Note, WorkProcessId, CreatedByEmployeeNumber)
+		SELECT @VendorSampleIncomingReturnNote,
+			WPI.WorkProcessId,
+			@CreatedBy
+		FROM #WorkProcessIds WPI
+		LEFT JOIN photo.ReturnNote RN
+		ON WPI.WorkProcessId = RN.WorkProcessId
+		WHERE RN.WorkProcessId IS NULL;
+
+
+
+		/*********************************************************
+		Sync Return Notes to Request Imange Portal (RIP) 
+		*********************************************************/	
+		UPDATE RIC
+			SET RIC.ItemComment = @VendorSampleIncomingReturnNote
+			, RIC.UpdatedBy= @CreatedBy
+		FROM  #ItemsToUpdate AS IU
+			 INNER JOIN #WorkProcessIds AS WPI ON WPI.ItemIdentifier = IU.ItemNumberId
+			 INNER JOIN requestImagePortal.RequestItem AS RI ON RI.ItemIdentifier = WPI.ItemIdentifier
+																AND RI.RequestId = WPI.RequestId
+			 INNER JOIN requestImagePortal.RequestItemComment AS RIC ON RIC.RequestItemId = RI.RequestItemId
+			 INNER JOIN requestImagePortal.RequestItemCommentType AS RICT ON RICT.RequestItemCommentTypeId = RIC.RequestItemCommentTypeId
+		WHERE  RICT.RequestItemCommentTypeId = @RequestCommentTypeId;
+
+
+		INSERT INTO requestImagePortal.RequestItemComment
+			(RequestItemId
+			, RequestItemCommentTypeId
+			, ItemComment
+			, UpdatedBy)
+		SELECT DISTINCT
+			RI.RequestItemId
+			 , @RequestCommentTypeId 
+			 , @VendorSampleIncomingReturnNote			 
+			 , @CreatedBy
+		FROM  #ItemsToUpdate AS IU
+			INNER JOIN #WorkProcessIds AS WPI ON WPI.ItemIdentifier = IU.ItemNumberId
+			INNER JOIN requestImagePortal.RequestItem RI ON WPI.ItemIdentifier = RI.ItemIdentifier	
+		WHERE 
+			NOT EXISTS (SELECT 1
+						FROM requestImagePortal.RequestItemComment AS RIC
+							INNER JOIN requestImagePortal.RequestItemCommentType AS RICT
+								ON RICT.RequestItemCommentTypeId = RIC.RequestItemCommentTypeId
+						WHERE RIC.RequestItemId = RI.RequestItemId
+							  AND RICT.RequestItemCommentTypeId = @RequestCommentTypeId
+						  );
+
+
+							  
+	END
+
+	/*InStudio Management */
+	  UPDATE IWSWP
+	  SET ItemWorkflowStatusId = @VideoRequiredWorkFlowStatus
+	  FROM 
+		#ItemsToUpdate AS IU
+		INNER JOIN #WorkProcessIds AS WPI ON WPI.ItemIdentifier = IU.ItemNumberId
+		INNER JOIN photo.ItemWorkflowStatusToWorkProcess AS IWSWP ON IWSWP.WorkProcessId = wpi.WorkProcessId
+		INNER JOIN photo.ItemWorkflowStatus AS IWS ON IWS.ItemWorkflowStatusId = IWSWP.ItemWorkflowStatusId
+		INNER JOIN photo.ItemWorkflowStatusType AS IWST ON IWST.ItemWorkflowStatusTypeId = IWS.ItemWorkflowStatusTypeId 
+	  WHERE IU.IsVideoRequired = 1
+	    AND IWSWP.IsActive = 1
+	    AND IWST.WorkflowStatusTypeName = 'Video'
+	    AND IWS.WorkflowStatus = 'Needs Triage';
+  
+  
+	IF @WorkProcessIds IS NOT NULL
+
+	BEGIN
+
+	EXEC [photo].[StoUpdateWaitingForStockProductStatus] @WorkProcessIds; 
+
+	EXEC [photo].[StoUpdateKitStatusFromComponents] @WorkProcessIds; 
+	END
+
+    DROP TABLE IF EXISTS #ItemsToUpdate;
+    DROP TABLE IF EXISTS #WorkProcessIds;
+    DROP TABLE IF EXISTS #MostRecentItemIdentifier;
+    DROP TABLE IF EXISTS #ItemNumbersToRequestIds;
+	DROP TABLE IF EXISTS #ParentItemNumberIds;
+	DROP TABLE IF EXISTS #ChildrenWorkProcessIds;
+	DROP TABLE IF EXISTS #WorkProcessToRequestItemIdsToUpdate;
+
+END;
+GO
+
+EXEC sys.sp_addextendedproperty @name=N'MS_Description', @value=N'Updates multiple work items' , @level0type=N'SCHEMA',@level0name=N'photo', @level1type=N'PROCEDURE',@level1name=N'StoUpdateMultipleWorkItems'
+GO
+
+
